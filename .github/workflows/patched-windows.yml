@@ -1,0 +1,235 @@
+name: Patched Windows installer
+
+on:
+  schedule:
+    - cron: "20 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Source for the installer
+        type: choice
+        options:
+          - upstream-stable
+          - patched-current
+        default: upstream-stable
+
+permissions: {}
+
+concurrency:
+  group: patched-windows-installer
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: pingdotgg/t3code
+  PATCH_BASE: 9292b03dc82e456979c0f3ffae5dda877a64e388
+  PATCH_FIRST: f0ae36f0d946975ff5009678b49bc1cf708769ed
+  PATCH_HEAD: 1e0b1fd11a7a8cca4318b4032fe59f08c82b060d
+  # The patch base was on the 0.1.12 nightly train after stable 0.1.11.
+  PATCHED_CURRENT_VERSION: "0.1.12"
+
+jobs:
+  resolve:
+    name: Select installer source
+    if: github.repository == 'leekmny/t3code' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      source_tag: ${{ steps.source.outputs.source_tag }}
+      version: ${{ steps.source.outputs.version }}
+      artifact: ${{ steps.source.outputs.artifact }}
+    steps:
+      - name: Resolve source and check existing artifacts
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_MODE: ${{ inputs.source || 'upstream-stable' }}
+        run: |
+          if [[ "$SOURCE_MODE" == patched-current ]]; then
+            source_sha="$PATCH_HEAD"
+            source_tag=""
+            version="$PATCHED_CURRENT_VERSION"
+            artifact="t3code-patched-current-${PATCH_HEAD:0:12}-win-x64-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          else
+            source_tag=$(gh api "repos/$UPSTREAM_REPOSITORY/releases/latest" \
+              --jq 'select(.draft == false and .prerelease == false) | .tag_name')
+            if [[ ! "$source_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo '::error::The latest upstream release must have a stable vX.Y.Z tag.'
+              exit 1
+            fi
+            source_sha=$(gh api "repos/$UPSTREAM_REPOSITORY/commits/refs/tags/$source_tag" --jq '.sha')
+            if [[ ! "$source_sha" =~ ^[a-f0-9]{40}$ ]]; then
+              echo '::error::Could not resolve the upstream release tag to a commit.'
+              exit 1
+            fi
+            status=$(gh api "repos/$UPSTREAM_REPOSITORY/compare/$PATCH_BASE...$source_sha?per_page=1" --jq '.status')
+            case "$status" in
+              behind)
+                echo "Upstream $source_tag predates the patch base $PATCH_BASE. A newer stable release is required." | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 0
+                ;;
+              ahead|identical) ;;
+              *)
+                echo "::error::Upstream $source_tag does not contain the patch base $PATCH_BASE (comparison: $status)."
+                exit 1
+                ;;
+            esac
+
+            version="${source_tag#v}"
+            artifact="t3code-patched-${source_tag}-${source_sha:0:12}-${PATCH_HEAD:0:12}-win-x64"
+            existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$artifact&per_page=100" \
+              --jq '.artifacts[] | select(.expired == false and .workflow_run != null) | [.workflow_run.id, .id] | @tsv')
+            while IFS=$'\t' read -r run_id artifact_id; do
+              [[ -n "$run_id" ]] || continue
+              match=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+                --jq 'select(.path == ".github/workflows/patched-windows.yml" and .conclusion == "success") | .id')
+              if [[ -n "$match" ]]; then
+                echo "A successful build already has an [installer artifact]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts/$artifact_id) for $source_tag." | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+            done <<< "$existing"
+          fi
+
+          # Preview versions prevent electron-builder from generating updater metadata.
+          version="$version-preview.$(date -u +%Y%m%d).$GITHUB_RUN_NUMBER"
+          {
+            echo "source_sha=$source_sha"
+            echo "source_tag=$source_tag"
+            echo "version=$version"
+            echo "artifact=$artifact"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Test and build Windows x64 NSIS
+    needs: resolve
+    if: needs.resolve.outputs.source_sha != ''
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      SOURCE_TAG: ${{ needs.resolve.outputs.source_tag }}
+      BUILD_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Check out pinned source and apply patches
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          git init .
+          git config core.longpaths true
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git fetch --no-tags --depth=3 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$PATCH_HEAD"
+          if [[ "$(git rev-parse "$PATCH_HEAD^" "$PATCH_FIRST^" | paste -sd ' ')" != "$PATCH_FIRST $PATCH_BASE" ]]; then
+            echo '::error::The pinned patch commits do not form the expected chain.'
+            exit 1
+          fi
+
+          if [[ -z "$SOURCE_TAG" ]]; then
+            git checkout --detach "$PATCH_HEAD"
+          else
+            git fetch --no-tags --depth=1 "$GITHUB_SERVER_URL/$UPSTREAM_REPOSITORY.git" "refs/tags/$SOURCE_TAG"
+            if [[ "$(git rev-parse 'FETCH_HEAD^{commit}')" != "$SOURCE_SHA" ]]; then
+              echo "::error::Upstream $SOURCE_TAG moved while this workflow was running. Start a new run."
+              exit 1
+            fi
+            git checkout --detach "$SOURCE_SHA"
+            if ! git -c user.name='Patched Windows installer' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              cherry-pick -x --empty=drop "$PATCH_FIRST" "$PATCH_HEAD"; then
+              echo "::error::Could not apply the Codex patches to $SOURCE_TAG. Review the git output and update the pinned patches."
+              git status --short
+              git cherry-pick --abort
+              exit 1
+            fi
+          fi
+
+      - name: Set up Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Install dependencies
+        shell: bash
+        run: vp install --frozen-lockfile --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts... --filter=@t3tools/web...
+
+      - name: Test Codex account switch and thread stop
+        shell: bash
+        run: |
+          (cd apps/server && vp test run src/provider/CodexAccountSwitch.test.ts)
+          (cd apps/server && vp test run src/orchestration-v2/ProviderSessionManager.test.ts \
+            -t 'discards a runtime opened across an account change|unloads the .* native thread on detach')
+          (cd apps/web && vp test run --project unit src/hooks/useThreadActionMenu.test.ts)
+
+      - name: Compile Windows resource monitor
+        shell: bash
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-pc-windows-msvc
+
+      - name: Build unsigned Windows installer
+        shell: bash
+        env:
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "true"
+          T3CODE_DESKTOP_SIGNED: "false"
+          # Skip Windows-only compile-cache generation, which exceeds the payload file limit.
+          T3CODE_DESKTOP_UNTRUSTED_BUNDLE: "true"
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          T3CODE_TELEMETRY_CHANNEL: dev
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: |
+          unset GITHUB_REPOSITORY T3CODE_DESKTOP_UPDATE_REPOSITORY
+          vp run dist:desktop:artifact --platform win --target nsis --arch x64 \
+            --build-version "$BUILD_VERSION" --output-dir release-patched --keep-stage --verbose
+
+      - name: Verify and stage installer
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath release-patched -Filter 'T3-Code-*.exe' -File)
+          if ($installers.Count -ne 1 -or $installers[0].Length -eq 0) {
+            throw 'Expected one nonempty NSIS installer.'
+          }
+          if ((Get-AuthenticodeSignature -LiteralPath $installers[0].FullName).Status -ne 'NotSigned') {
+            throw 'Expected an unsigned NSIS installer.'
+          }
+          $stages = @(Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Directory -Filter 't3code-desktop-win-stage-*')
+          if ($stages.Count -ne 1) {
+            throw 'Expected one desktop packaging directory.'
+          }
+          $app = Join-Path $stages[0].FullName 'app/dist/win-unpacked'
+          $resources = Join-Path $app 'resources'
+          if (!(Test-Path -LiteralPath "$resources/server.asar") -or (Test-Path -LiteralPath "$resources/app-update.yml")) {
+            throw 'Expected a packaged server and no desktop updater feed.'
+          }
+          node scripts/verify-windows-desktop-artifact.ts --app-dir $app --arch x64 --build-version $env:BUILD_VERSION --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Path installer-artifact | Out-Null
+          $file = "T3-Code-$env:BUILD_VERSION-patched-win-x64.exe"
+          Copy-Item -LiteralPath $installers[0].FullName -Destination "installer-artifact/$file"
+          $hash = (Get-FileHash -LiteralPath "installer-artifact/$file" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $file" | Set-Content -LiteralPath installer-artifact/SHA256SUMS.txt -Encoding ascii
+          @(
+            "Version: $env:BUILD_VERSION"
+            "Upstream tag: $env:SOURCE_TAG"
+            "Source commit: $env:SOURCE_SHA"
+            "Patch commits: $env:PATCH_FIRST $env:PATCH_HEAD"
+            "Build commit: $(git rev-parse HEAD)"
+            "Run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            'Target: Windows x64 NSIS, unsigned, native Windows backend'
+          ) | Set-Content -LiteralPath installer-artifact/BUILD.txt -Encoding ascii
+
+      - name: Upload downloadable installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ needs.resolve.outputs.artifact }}
+          path: installer-artifact/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
