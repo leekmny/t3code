@@ -3155,6 +3155,7 @@ export const layerWithOptions = (
               if (stoppedByProvider && Exit.isSuccess(exit)) {
                 yield* releaseEntry({
                   providerSessionId: entry.runtime.providerSessionId,
+                  expectedRuntime: entry.runtime,
                   reason: "manual_shutdown",
                   gracefulSubscribers: true,
                 }).pipe(logReleaseFailure(entry.runtime.providerSessionId));
@@ -3180,6 +3181,7 @@ export const layerWithOptions = (
               });
               yield* releaseEntry({
                 providerSessionId: entry.runtime.providerSessionId,
+                expectedRuntime: entry.runtime,
                 reason: "runtime_error",
                 detail: makeProviderFailure({ cause }).message,
                 eventStreamCause: cause,
