@@ -25,6 +25,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as Semaphore from "effect/Semaphore";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -127,6 +128,8 @@ export class ProviderRegistry extends Context.Service<
     }) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
     readonly streamChanges: Stream.Stream<ReadonlyArray<ServerProvider>>;
+    /** Current snapshot followed by every committed snapshot, in order. */
+    readonly snapshotChanges: Stream.Stream<ReadonlyArray<ServerProvider>>;
   }
 >()("t3/provider/ProviderRegistry") {}
 
@@ -533,7 +536,7 @@ export const layer = Layer.effect(
         manifest.compatibility,
         ModelManifest.BUNDLED_MODEL_MANIFEST.compatibility,
       );
-    const providersRef = yield* Ref.make<ReadonlyArray<ServerProvider>>(
+    const providersRef = yield* SubscriptionRef.make<ReadonlyArray<ServerProvider>>(
       bootProviders.map((provider) => classifyCompatibility(provider, initialManifest)),
     );
     const workspaceRefreshesRef = yield* Ref.make<
@@ -607,7 +610,7 @@ export const layer = Layer.effect(
           concurrency: "unbounded",
         },
       );
-      const [previousProviders, providers, providersToPersist] = yield* Ref.modify(
+      const [previousProviders, providers, providersToPersist] = yield* SubscriptionRef.modify(
         providersRef,
         (previousProviders) => {
           const mergedProviders = new Map(
@@ -647,7 +650,7 @@ export const layer = Layer.effect(
         }
         if (options?.publish !== false) {
           // A newer upsert may have committed and published during the cache write; never republish an older array.
-          yield* PubSub.publish(changesPubSub, yield* Ref.get(providersRef));
+          yield* PubSub.publish(changesPubSub, yield* SubscriptionRef.get(providersRef));
         }
       }
 
@@ -708,7 +711,7 @@ export const layer = Layer.effect(
           return next;
         });
 
-        const existingProviders = yield* Ref.get(providersRef);
+        const existingProviders = yield* SubscriptionRef.get(providersRef);
         const matchingProvider = existingProviders.find(
           (candidate) => candidate.instanceId === input.instanceId,
         );
@@ -737,7 +740,7 @@ export const layer = Layer.effect(
       );
       // Settings can replace or remove the instance mid-probe; its late result or failure is stale.
       if (!(yield* isCurrentInstance(instance))) {
-        return yield* Ref.get(providersRef);
+        return yield* SubscriptionRef.get(providersRef);
       }
       const nextProvider = yield* probe;
       return yield* correlateSnapshotWithSource(providerSource, nextProvider).pipe(
@@ -765,7 +768,7 @@ export const layer = Layer.effect(
       ),
       Effect.flatMap((changed) =>
         changed
-          ? Ref.get(providersRef).pipe(
+          ? SubscriptionRef.get(providersRef).pipe(
               Effect.flatMap((providers) =>
                 instanceRegistryMutator.rebuild(
                   providers
@@ -815,7 +818,7 @@ export const layer = Layer.effect(
                   discard: true,
                 }),
               ),
-              Effect.andThen(Ref.get(providersRef)),
+              Effect.andThen(SubscriptionRef.get(providersRef)),
               Effect.tap(() => Ref.set(probedManifestUpdatedAt, updatedAt)),
             ),
           ),
@@ -844,7 +847,7 @@ export const layer = Layer.effect(
       yield* syncLiveSourcesAndContinue;
       const instance = (yield* Ref.get(liveSubsRef)).get(instanceId);
       if (!instance) {
-        return yield* Ref.get(providersRef);
+        return yield* SubscriptionRef.get(providersRef);
       }
       return yield* refreshOneSource(instance);
     });
@@ -862,7 +865,7 @@ export const layer = Layer.effect(
     ) {
       const instanceIds = yield* instanceRegistryMutator.applySecret(reference, value);
       yield* Effect.forEach(instanceIds, refreshInstance, { discard: true });
-      return yield* Ref.get(providersRef);
+      return yield* SubscriptionRef.get(providersRef);
     });
 
     const refreshAfterUpdate = Effect.fn("refreshAfterUpdate")(function* (
@@ -946,7 +949,7 @@ export const layer = Layer.effect(
       const refreshedInstanceIds = new Set(
         refreshedInstances.map((instance) => instance.instanceId),
       );
-      return (yield* Ref.get(providersRef)).filter((candidate) =>
+      return (yield* SubscriptionRef.get(providersRef)).filter((candidate) =>
         refreshedInstanceIds.has(candidate.instanceId),
       );
     });
@@ -1001,7 +1004,7 @@ export const layer = Layer.effect(
             .filter((instanceId) => previousSubs.has(instanceId)),
         );
         if (rebuiltInstanceIds.size > 0) {
-          const [previousProviders, providers] = yield* Ref.modify(
+          const [previousProviders, providers] = yield* SubscriptionRef.modify(
             providersRef,
             (previousProviders) => {
               const providers = previousProviders.map((provider) => {
@@ -1052,7 +1055,10 @@ export const layer = Layer.effect(
         );
         // A rename keeps the instance live, so its new label only arrives from a fresh read.
         const published = new Map(
-          (yield* Ref.get(providersRef)).map((provider) => [provider.instanceId, provider]),
+          (yield* SubscriptionRef.get(providersRef)).map((provider) => [
+            provider.instanceId,
+            provider,
+          ]),
         );
         yield* Effect.forEach(
           carriedOver.values(),
@@ -1082,7 +1088,7 @@ export const layer = Layer.effect(
         }
         yield* Ref.set(liveSubsRef, nextSubs);
 
-        const [previousProviders, providers] = yield* Ref.modify(
+        const [previousProviders, providers] = yield* SubscriptionRef.modify(
           providersRef,
           (previousProviders) => {
             const providers = orderProviderSnapshots(
@@ -1142,13 +1148,13 @@ export const layer = Layer.effect(
       yield* Effect.logError("provider registry refresh failed; preserving cached providers", {
         cause: Cause.pretty(cause),
       });
-      return yield* Ref.get(providersRef);
+      return yield* SubscriptionRef.get(providersRef);
     });
 
     const updateProviders = (
       update: (providers: ReadonlyArray<ServerProvider>) => ReadonlyArray<ServerProvider>,
     ) =>
-      Ref.modify(providersRef, (currentProviders) => {
+      SubscriptionRef.modify(providersRef, (currentProviders) => {
         const nextProviders = update(currentProviders);
         return [[currentProviders, nextProviders] as const, nextProviders];
       }).pipe(
@@ -1173,7 +1179,7 @@ export const layer = Layer.effect(
       // What clients saw before the awaited scan, which may already have published the change.
       const heldBeforeWait = input.rescan
         ? workspaceSnapshotOf(
-            (yield* Ref.get(providersRef)).find(
+            (yield* SubscriptionRef.get(providersRef)).find(
               (candidate) => candidate.instanceId === input.instanceId,
             ),
           )
@@ -1193,7 +1199,7 @@ export const layer = Layer.effect(
           ),
         );
       }
-      const providers = yield* Ref.get(providersRef);
+      const providers = yield* SubscriptionRef.get(providersRef);
       const provider = providers.find((candidate) => candidate.instanceId === input.instanceId);
       const scannedFrom = workspaceSnapshotOf(provider);
       const now = yield* DateTime.now;
@@ -1222,7 +1228,7 @@ export const layer = Layer.effect(
       const refreshMachineSnapshot = input.fresh
         ? (instance.invalidateCaches ?? Effect.void).pipe(
             Effect.andThen(refreshInstance(input.instanceId)),
-            Effect.andThen(Ref.get(providersRef)),
+            Effect.andThen(SubscriptionRef.get(providersRef)),
             Effect.map((current) =>
               workspaceSnapshotOf(
                 current.find((candidate) => candidate.instanceId === input.instanceId),
@@ -1241,7 +1247,7 @@ export const layer = Layer.effect(
         Effect.flatMap(({ scanBase, scopedSnapshot }) =>
           instanceRegistry.getInstance(input.instanceId).pipe(
             Effect.flatMap((currentInstance) => {
-              if (currentInstance !== instance) return Ref.get(providersRef);
+              if (currentInstance !== instance) return SubscriptionRef.get(providersRef);
               return updateProviders((currentProviders) => {
                 // Read ownership inside the update so a newer claim cannot race publication.
                 if (Ref.getUnsafe(workspaceRefreshesRef).get(instance)?.get(input.cwd) !== token) {
@@ -1310,7 +1316,9 @@ export const layer = Layer.effect(
       );
       // Wait for the running scan: on-demand clients get its result only in this reply.
       if ("inFlight" in claim) {
-        return yield* Deferred.await(claim.inFlight).pipe(Effect.andThen(Ref.get(providersRef)));
+        return yield* Deferred.await(claim.inFlight).pipe(
+          Effect.andThen(SubscriptionRef.get(providersRef)),
+        );
       }
       return yield* Fiber.join(claim.scan);
     });
@@ -1360,7 +1368,7 @@ export const layer = Layer.effect(
     });
 
     return {
-      getProviders: Ref.get(providersRef),
+      getProviders: SubscriptionRef.get(providersRef),
       refresh: (provider?: ProviderDriverKind) =>
         refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
       refreshInstance: (instanceId: ProviderInstanceId) =>
@@ -1382,6 +1390,7 @@ export const layer = Layer.effect(
       get streamChanges() {
         return Stream.fromPubSub(changesPubSub);
       },
+      snapshotChanges: SubscriptionRef.changes(providersRef),
     } satisfies ProviderRegistry["Service"];
   }),
 );

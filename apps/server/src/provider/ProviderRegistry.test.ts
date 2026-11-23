@@ -508,6 +508,7 @@ const makeUpdateState = (status: ServerProviderUpdateState["status"]) =>
 // One Codex instance whose probe returns whatever `snapshot` currently holds.
 const buildRegistryOverSnapshot = Effect.fn("buildRegistryOverSnapshot")(function* (
   snapshot: Ref.Ref<ServerProvider>,
+  streamChanges: Stream.Stream<ServerProvider> = Stream.empty,
 ) {
   const driver = ProviderDriverKind.make("codex");
   const instance = {
@@ -523,7 +524,7 @@ const buildRegistryOverSnapshot = Effect.fn("buildRegistryOverSnapshot")(functio
         ),
       getSnapshot: Ref.get(snapshot),
       refresh: Ref.get(snapshot),
-      streamChanges: Stream.empty,
+      streamChanges,
       applyUsageLimits: () => Effect.void,
     },
     orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
@@ -4091,6 +4092,60 @@ it.layer(
           ]);
         }).pipe(Effect.provide(runtimeServices));
       }),
+    );
+
+    it.effect("preserves logout and re-login while a provider snapshot subscriber is behind", () =>
+      Effect.gen(function* () {
+        const signedIn = {
+          ...codexUpdateSnapshot("current"),
+          auth: { status: "authenticated", email: "account@example.test" },
+        } as const;
+        const signedOut = {
+          ...signedIn,
+          auth: { status: "unauthenticated" },
+          checkedAt: "2026-06-10T00:00:01.000Z",
+        } as const;
+        const signedInAgain = { ...signedIn, checkedAt: "2026-06-10T00:00:02.000Z" };
+        const snapshot = yield* Ref.make<ServerProvider>(signedIn);
+        const updates = yield* Queue.unbounded<ServerProvider>();
+        const runtimeServices = yield* buildRegistryOverSnapshot(
+          snapshot,
+          Stream.fromQueue(updates),
+        );
+
+        yield* Effect.gen(function* () {
+          const registry = yield* ProviderRegistry.ProviderRegistry;
+          const started = yield* Deferred.make<void>();
+          const unblock = yield* Deferred.make<void>();
+          const observed = yield* registry.snapshotChanges.pipe(
+            Stream.map((providers) => providers[0]),
+            Stream.changesWith((a, b) => a?.checkedAt === b?.checkedAt),
+            Stream.tap(() =>
+              Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(unblock))),
+            ),
+            Stream.takeUntil((provider) => provider?.checkedAt === signedInAgain.checkedAt),
+            Stream.map((provider) => provider?.auth.status),
+            Stream.runCollect,
+            Effect.forkScoped,
+          );
+          yield* Deferred.await(started);
+          const refreshed = yield* registry.streamChanges.pipe(
+            Stream.filter((providers) => providers[0]?.checkedAt === signedInAgain.checkedAt),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped({ startImmediately: true }),
+          );
+          yield* Queue.offerAll(updates, [signedOut, signedInAgain]);
+          yield* Fiber.join(refreshed);
+
+          yield* Deferred.succeed(unblock, undefined);
+          assert.deepStrictEqual(yield* Fiber.join(observed), [
+            "authenticated",
+            "unauthenticated",
+            "authenticated",
+          ]);
+        }).pipe(Effect.provide(runtimeServices));
+      }).pipe(Effect.scoped),
     );
 
     describe("update results across refreshes", () => {

@@ -19,6 +19,7 @@ export function ThreadHeader(props: {
   readonly subtitle: string;
   readonly gitControls: ThreadGitControlsProps;
   readonly onReturnToThread?: () => void;
+  readonly onStopBackgroundWork?: (() => void) | undefined;
   readonly draft?: boolean;
   readonly hasThreadCwd: boolean;
   readonly inspectorMode: ThreadInspectorMode | null;
@@ -45,6 +46,20 @@ export function ThreadHeader(props: {
       ]
     : [];
   const menus = [gitMenu, terminalMenu].filter((menu): menu is AppBarMenu => menu !== null);
+  if (props.onStopBackgroundWork) {
+    menus.push({
+      title: gt("More actions"),
+      icon: "ellipsis",
+      items: [
+        {
+          id: "stop-background-work",
+          title: gt("Stop background work"),
+          icon: "stop.fill",
+          onPress: props.onStopBackgroundWork,
+        },
+      ],
+    });
+  }
 
   return (
     <AppBar

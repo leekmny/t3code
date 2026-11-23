@@ -1952,6 +1952,11 @@ export default function ChatView(props: ChatViewProps) {
     useComposerFocus(composerRef);
   const canInterruptRunningThread =
     canOperateThread && deriveCanInterruptRunningThread(activeThread !== undefined, activeRuntime);
+  const canStopBackgroundWork =
+    canOperateThread &&
+    activeThreadShell?.archivedAt === null &&
+    activeLatestRun !== null &&
+    serverConfig?.environment.capabilities.threadStop === true;
   const onInterrupt = async () => {
     if (
       !activeThread ||
@@ -2943,7 +2948,7 @@ export default function ChatView(props: ChatViewProps) {
         composerRef.current?.isCaretAtStart() === true &&
         queuedRunsControlRef.current?.editLatest(event.repeat) === true,
       "thread.stop": ({ event }) => {
-        if (!canInterruptRunningThread) return false;
+        if (!canInterruptRunningThread && !canStopBackgroundWork) return false;
         if (!event.repeat) void onInterruptStable();
       },
     },

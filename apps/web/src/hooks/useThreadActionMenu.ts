@@ -34,6 +34,7 @@ import { readEnvironmentScope } from "../state/session";
 import {
   readEnvironmentServerConfigLoaded,
   readEnvironmentSupportsAutoSettleOptOut,
+  readEnvironmentSupportsThreadStop,
   readThreadShell,
   useProjects,
 } from "../state/entities";
@@ -95,6 +96,9 @@ export function useThreadActionMenu(input: {
   const regenerateThreadTitle = useOrchestrationCommand(threadEnvironment.regenerateTitle, {
     reportFailure: false,
   });
+  const interruptThread = useOrchestrationCommand(threadEnvironment.interruptTurn, {
+    reportFailure: false,
+  });
   const handleNewThread = useNewThreadHandler();
   const confirmThreadDelete = useClientSettings((s) => s.confirmThreadDelete);
   const confirmThreadArchive = useClientSettings((s) => s.confirmThreadArchive);
@@ -141,6 +145,10 @@ export function useThreadActionMenu(input: {
       const items = buildThreadActionMenuItems({
         canOperate: readEnvironmentScope(threadRef.environmentId, AuthOrchestrationOperateScope),
         canFind: onFind !== undefined,
+        canStop:
+          thread.archivedAt === null &&
+          thread.latestRun !== null &&
+          readEnvironmentSupportsThreadStop(threadRef.environmentId),
         branch: thread.branch ?? null,
         projectFilter: null,
         isPinned: thread.pinnedAt != null,
@@ -198,6 +206,15 @@ export function useThreadActionMenu(input: {
       switch (action) {
         case "find":
           onFind?.(threadRef);
+          return;
+        case "stop":
+          if (!readEnvironmentSupportsThreadStop(threadRef.environmentId)) return;
+          await reportFailure(m(msg("Failed to interrupt the current turn.")), () =>
+            interruptThread({
+              environmentId: threadRef.environmentId,
+              input: { threadId: threadRef.threadId },
+            }),
+          );
           return;
         case "project-settings": {
           const project = projects.find(

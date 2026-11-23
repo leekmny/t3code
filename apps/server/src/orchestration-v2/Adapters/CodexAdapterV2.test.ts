@@ -4960,6 +4960,72 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
+  it.effect("waits for the native writer to close after explicitly detaching a thread", () =>
+    Effect.gen(function* () {
+      const nativeThreadId = "detaching-thread";
+      const closureReady = yield* Deferred.make<void>();
+      const releaseClosure = yield* Deferred.make<void>();
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "detach-writer-release",
+          entries: [
+            ...codexReplayPreamble({
+              nativeThreadId,
+              nativeTurnId: "unused-turn",
+              prompt: "unused-prompt",
+            }).slice(0, 5),
+            {
+              type: "expect_outbound",
+              label: "unsubscribe",
+              frame: {
+                id: 3,
+                method: "thread/unsubscribe",
+                params: { threadId: nativeThreadId },
+              },
+            },
+            {
+              type: "emit_inbound",
+              label: "unsubscribe response",
+              frame: { id: 3, result: { status: "unsubscribed" } },
+            },
+            {
+              type: "emit_inbound",
+              label: "writer closed",
+              frame: { method: "thread/closed", params: { threadId: nativeThreadId } },
+            },
+          ],
+        }),
+        undefined,
+        undefined,
+        undefined,
+        (entry) =>
+          entry.label === "writer closed"
+            ? Deferred.succeed(closureReady, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseClosure)),
+              )
+            : Effect.void,
+      );
+      const unload = yield* harness.runtime.unloadThread!({
+        providerThread: harness.providerThread,
+        awaitClosure: true,
+      }).pipe(Effect.forkScoped);
+      yield* Deferred.await(closureReady);
+      yield* TestClock.adjust("1 millis");
+      assert.isUndefined(unload.pollUnsafe());
+      yield* Deferred.succeed(releaseClosure, undefined);
+      yield* Fiber.join(unload);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
   // regression: #33747 Codex refuses thread/resume until an unsubscribed thread finishes closing
   it.effect.each([
     { name: "waits for thread/closed after a closing error", closedFirst: false },

@@ -135,6 +135,7 @@ function makeTestAdapter(input: {
   };
   readonly backgroundTasksEndWithProcess?: true;
   readonly backgroundWork?: Ref.Ref<boolean>;
+  readonly onInterrupt?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"];
   readonly closedSessions?: Ref.Ref<ReadonlyArray<string>>;
   /** Like ACP: opening resumes the initial native id, and forcing a new thread restarts the runtime. */
   readonly runtimeStarts?: Ref.Ref<ReadonlyArray<string>>;
@@ -500,7 +501,7 @@ function makeTestAdapter(input: {
               }
             }),
           steerTurn: () => Effect.void,
-          interruptTurn: () => Effect.void,
+          interruptTurn: input.onInterrupt ?? (() => Effect.void),
           respondToRuntimeRequest: () => Effect.void,
           readThreadSnapshot: () =>
             unimplemented(input.driver, "readThreadSnapshot unused in provider switch test"),
@@ -4380,21 +4381,25 @@ describe("orchestration v2 provider switching", () => {
   it.live.each([
     [
       "detaches the previous instance's session when a send hands off to another instance",
-      { background: false, queued: false, sharedHistory: false },
+      { background: false, queued: false, sharedHistory: false, neon: false },
     ],
     [
-      "refuses the hand-off while the previous instance still runs background work",
-      { background: true, queued: false, sharedHistory: false },
+      "keeps a busy previous session running when an immediate hand-off starts",
+      { background: true, queued: false, sharedHistory: false, neon: false },
     ],
     [
       "keeps a busy previous session running when a queued hand-off starts",
-      { background: true, queued: true, sharedHistory: false },
+      { background: true, queued: true, sharedHistory: false, neon: false },
     ],
     [
       "holds a queued account switch while the replaced session still runs background work",
-      { background: true, queued: true, sharedHistory: true },
+      { background: true, queued: true, sharedHistory: true, neon: false },
     ],
-  ] as const)("%s", ([, { background, queued, sharedHistory }]) =>
+    [
+      "hands Codex context to Neon and back after adapter-only background work finishes",
+      { background: true, queued: false, sharedHistory: false, neon: true },
+    ],
+  ] as const)("%s", ([, { background, queued, sharedHistory, neon }]) =>
     Effect.gen(function* () {
       const cwd = yield* checkpointWorkspace("handoff-releases-session");
       const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
@@ -4402,26 +4407,32 @@ describe("orchestration v2 provider switching", () => {
       const closedSessions = yield* Ref.make<ReadonlyArray<string>>([]);
       const firstStarted = yield* Deferred.make<void>();
       const releaseFirst = yield* Deferred.make<void>();
-      const secondSelection: ModelSelection = {
-        ...CLAUDE_MODEL_SELECTION,
-        instanceId: ProviderInstanceId.make("claude-second-account"),
-      };
+      const firstSelection = neon ? CODEX_MODEL_SELECTION : CLAUDE_MODEL_SELECTION;
+      const secondSelection: ModelSelection = neon
+        ? {
+            instanceId: ProviderInstanceId.make("antigravity"),
+            model: "gemini-pro-orchestrator-neon",
+          }
+        : {
+            ...CLAUDE_MODEL_SELECTION,
+            instanceId: ProviderInstanceId.make("claude-second-account"),
+          };
       const adapters = [
         makeTestAdapter({
-          instanceId: CLAUDE_MODEL_SELECTION.instanceId,
-          driver: CLAUDE_DRIVER,
-          capabilities: ClaudeProviderCapabilitiesV2,
-          modelSelection: CLAUDE_MODEL_SELECTION,
+          instanceId: firstSelection.instanceId,
+          driver: neon ? CODEX_DRIVER : CLAUDE_DRIVER,
+          capabilities: neon ? CodexProviderCapabilitiesV2 : ClaudeProviderCapabilitiesV2,
+          modelSelection: firstSelection,
           responseByRunOrdinal: { 1: "First account complete" },
           capturedTurns,
-          backgroundWork,
+          ...(neon ? { pendingBackgroundWork: backgroundWork } : { backgroundWork }),
           closedSessions,
           ...(queued ? { holdFirstTurn: firstStarted, releaseFirstTurn: releaseFirst } : {}),
         }),
         makeTestAdapter({
           instanceId: secondSelection.instanceId,
-          driver: CLAUDE_DRIVER,
-          capabilities: ClaudeProviderCapabilitiesV2,
+          driver: neon ? ProviderDriverKind.make("antigravity") : CLAUDE_DRIVER,
+          capabilities: neon ? AcpProviderCapabilitiesV2 : ClaudeProviderCapabilitiesV2,
           modelSelection: secondSelection,
           responseByRunOrdinal: { 2: "Second account complete" },
           capturedTurns,
@@ -4478,13 +4489,13 @@ describe("orchestration v2 provider switching", () => {
           threadId: handoffThreadId,
           projectId: ProjectId.make("project:handoff-releases-session"),
           title: "Handoff releases session",
-          modelSelection: CLAUDE_MODEL_SELECTION,
+          modelSelection: firstSelection,
           runtimeMode: "full-access",
           interactionMode: "default",
           branch: null,
           worktreePath: cwd,
         });
-        yield* send(1, CLAUDE_MODEL_SELECTION);
+        yield* send(1, firstSelection);
 
         if (queued) {
           yield* Deferred.await(firstStarted);
@@ -4505,7 +4516,7 @@ describe("orchestration v2 provider switching", () => {
           yield* worker.drain();
           const afterQueue = yield* orchestrator.getThreadProjection(handoffThreadId);
           const firstSession = afterQueue.providerSessions.find(
-            (session) => session.providerInstanceId === CLAUDE_MODEL_SELECTION.instanceId,
+            (session) => session.providerInstanceId === firstSelection.instanceId,
           );
           // Detaching would end the background agents, so the busy session must stay up.
           assert.deepEqual(yield* Ref.get(closedSessions), []);
@@ -4514,7 +4525,7 @@ describe("orchestration v2 provider switching", () => {
             assert.deepEqual(
               afterQueue.runs.map((run) => [run.providerInstanceId, run.status]),
               [
-                [CLAUDE_MODEL_SELECTION.instanceId, "completed"],
+                [firstSelection.instanceId, "completed"],
                 [secondSelection.instanceId, "completed"],
               ],
             );
@@ -4540,7 +4551,7 @@ describe("orchestration v2 provider switching", () => {
           assert.deepEqual(
             resumed.runs.map((run) => [run.providerInstanceId, run.status]),
             [
-              [CLAUDE_MODEL_SELECTION.instanceId, "completed"],
+              [firstSelection.instanceId, "completed"],
               [secondSelection.instanceId, "completed"],
             ],
           );
@@ -4551,26 +4562,12 @@ describe("orchestration v2 provider switching", () => {
         yield* worker.drain();
         const afterFirst = yield* waitForIdle(handoffThreadId);
         const firstSession = afterFirst.providerSessions.find(
-          (session) => session.providerInstanceId === CLAUDE_MODEL_SELECTION.instanceId,
+          (session) => session.providerInstanceId === firstSelection.instanceId,
         );
         assert.equal(firstSession?.status, "ready");
 
-        if (background) {
-          // Native subagents live only in the adapter's roster, so the projection's
-          // pendingBackgroundTasks stays empty while the probe still reports work.
-          assert.deepEqual(afterFirst.providerThreads[0]?.pendingBackgroundTasks ?? [], []);
-          const refused = yield* send(2, secondSelection, ":refused").pipe(Effect.flip);
-          assert.include(String(refused.cause), "still running background agents or commands");
-          const unchanged = yield* orchestrator.getThreadProjection(handoffThreadId);
-          assert.lengthOf(unchanged.runs, 1);
-          assert.deepEqual(yield* Ref.get(closedSessions), []);
-          assert.equal(unchanged.thread.providerInstanceId, CLAUDE_MODEL_SELECTION.instanceId);
-          assert.deepEqual(
-            unchanged.providerSessions.map((session) => [session.id, session.status]),
-            [[firstSession!.id, "ready"]],
-          );
-          yield* Ref.set(backgroundWork, false);
-        }
+        // Native subagents may live only in the adapter despite an empty projected roster.
+        assert.deepEqual(afterFirst.providerThreads[0]?.pendingBackgroundTasks ?? [], []);
 
         yield* send(2, secondSelection);
         yield* worker.drain();
@@ -4581,17 +4578,28 @@ describe("orchestration v2 provider switching", () => {
         assert.deepEqual(
           projection.runs.map((run) => [run.providerInstanceId, run.status]),
           [
-            [CLAUDE_MODEL_SELECTION.instanceId, "completed"],
+            [firstSelection.instanceId, "completed"],
             [secondSelection.instanceId, "completed"],
           ],
         );
         assert.lengthOf(afterSecond.contextHandoffs, 1);
-        assert.deepEqual(
+        assert.sameMembers(
           projection.providerSessions.map((session) => session.providerInstanceId),
-          [secondSelection.instanceId],
+          background
+            ? [firstSelection.instanceId, secondSelection.instanceId]
+            : [secondSelection.instanceId],
         );
         // The detached event alone hides the session; the runtime must also close.
-        assert.deepEqual(yield* Ref.get(closedSessions), [firstSession!.id]);
+        assert.deepEqual(yield* Ref.get(closedSessions), background ? [] : [firstSession!.id]);
+        if (neon) {
+          yield* Ref.set(backgroundWork, false);
+          yield* send(3, firstSelection);
+          yield* worker.drain();
+          const returned = yield* waitForIdle(handoffThreadId);
+          assert.equal(returned.runs.at(-1)?.providerInstanceId, CODEX_MODEL_SELECTION.instanceId);
+          assert.equal(returned.runs.at(-1)?.status, "completed");
+          assert.lengthOf(returned.contextHandoffs, 2);
+        }
       }).pipe(
         Effect.provide(
           ProviderReplayHarness.layerWithRegistry(
@@ -4739,12 +4747,13 @@ describe("orchestration v2 provider switching", () => {
 
   // regression: a session kept by a queued hand-off is probed when a later change detaches it
   it.live(
-    "refuses a later instance change while a retained hand-off session runs background work",
+    "keeps earlier busy sessions attached through another provider selection and stops their hidden work",
     () =>
       Effect.gen(function* () {
         const cwd = yield* checkpointWorkspace("retained-session-background");
         const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
         const codexBackgroundWork = yield* Ref.make(true);
+        const stoppedProviderThreads = yield* Ref.make<ReadonlyArray<ProviderThreadId>>([]);
         const firstStarted = yield* Deferred.make<void>();
         const releaseFirst = yield* Deferred.make<void>();
         const threadId = ThreadId.make("thread:retained-session-background");
@@ -4804,18 +4813,30 @@ describe("orchestration v2 provider switching", () => {
           );
           assert.equal(codexSession?.status, "ready");
 
-          const refused = yield* selectGrok("busy").pipe(Effect.flip);
-          assert.include(String(refused.cause), "still running background agents or commands");
+          yield* selectGrok("busy");
           yield* worker.drain();
-          const unchanged = yield* orchestrator.getThreadProjection(threadId);
-          assert.equal(unchanged.thread.providerInstanceId, CLAUDE_MODEL_SELECTION.instanceId);
+          const selected = yield* orchestrator.getThreadProjection(threadId);
+          assert.equal(selected.thread.providerInstanceId, GROK_MODEL_SELECTION.instanceId);
           assert.include(
-            unchanged.providerSessions.map((session) => session.id),
+            selected.providerSessions.map((session) => session.id),
             codexSession!.id,
           );
 
-          yield* Ref.set(codexBackgroundWork, false);
-          yield* selectGrok("idle");
+          assert.deepEqual(
+            afterHandoff.providerThreads.flatMap((thread) => thread.pendingBackgroundTasks ?? []),
+            [],
+          );
+          yield* orchestrator.dispatch({
+            type: "thread.stop",
+            commandId: CommandId.make("command:retained-session-background:stop"),
+            threadId,
+          });
+          yield* worker.drain();
+          assert.deepEqual(yield* Ref.get(stoppedProviderThreads), [
+            afterHandoff.runs[0]!.providerThreadId!,
+          ]);
+          assert.isFalse(yield* Ref.get(codexBackgroundWork));
+          yield* send(3, GROK_MODEL_SELECTION);
           yield* worker.drain();
           const switched = yield* orchestrator.getThreadProjection(threadId);
           assert.equal(switched.thread.providerInstanceId, GROK_MODEL_SELECTION.instanceId);
@@ -4847,6 +4868,11 @@ describe("orchestration v2 provider switching", () => {
                   responseByRunOrdinal: { 1: "Codex started background work" },
                   capturedTurns,
                   pendingBackgroundWork: codexBackgroundWork,
+                  onInterrupt: ({ providerThread }) =>
+                    Ref.update(stoppedProviderThreads, (threads) => [
+                      ...threads,
+                      providerThread.id,
+                    ]).pipe(Effect.andThen(Ref.set(codexBackgroundWork, false))),
                   holdFirstTurn: firstStarted,
                   releaseFirstTurn: releaseFirst,
                 }),

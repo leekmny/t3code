@@ -12,6 +12,7 @@ export type ThreadActionMenuId =
   | "project-settings"
   | "pin"
   | "unpin"
+  | "stop"
   | "settle"
   | "unsettle"
   | "auto-settle"
@@ -96,6 +97,7 @@ export function buildDraftActionMenuItems(
 export interface ThreadActionMenuState {
   readonly canOperate: boolean;
   readonly canFind?: boolean;
+  readonly canStop?: boolean;
   /** False where no inline title editor is rendered, such as sidebar search results. */
   readonly canRename?: boolean;
   readonly branch: string | null;
@@ -166,6 +168,9 @@ export function buildThreadActionMenuItems(
             ? { id: "unpin" as const, label: resolve(msg("Unpin thread")), icon: "pin-off" }
             : { id: "pin" as const, label: resolve(msg("Pin thread")), icon: "pin" },
         ]
+      : []),
+    ...(state.canStop && !state.isRunning
+      ? [{ id: "stop" as const, label: resolve(msg("Stop background work")), icon: "square" }]
       : []),
     ...(state.supports.settlement
       ? [

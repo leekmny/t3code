@@ -686,11 +686,14 @@ function ThreadRouteContent(
   const handleOpenConnectionEditor = () => {
     void navigation.navigate("Connections");
   };
+  const supportsThreadStop =
+    routeEnvironmentRuntime?.serverConfig?.environment.capabilities.threadStop === true;
   const handleStopThread = () => {
+    const runId = supportsThreadStop ? null : composer.interruptibleRunId;
     if (
       !selectedThread ||
       !readEnvironmentScope(selectedThread.environmentId, AuthOrchestrationOperateScope) ||
-      composer.interruptibleRunId === null
+      (!supportsThreadStop && runId === null)
     ) {
       return;
     }
@@ -698,7 +701,7 @@ function ThreadRouteContent(
       environmentId: selectedThread.environmentId,
       input: {
         threadId: selectedThread.id,
-        runId: composer.interruptibleRunId,
+        ...(runId === null ? {} : { runId }),
       },
     });
   };
@@ -1048,6 +1051,16 @@ function ThreadRouteContent(
                 inspectorMode={inspectorMode}
                 onOpenFilesInspector={handleOpenFilesInspector}
                 onReturnToThread={props.onReturnToThread}
+                onStopBackgroundWork={
+                  supportsThreadStop &&
+                  canOperateThread &&
+                  !awaitingBootstrapTurn &&
+                  composer.interruptibleRunId === null &&
+                  selectedThread.archivedAt === null &&
+                  selectedThread.latestRun !== null
+                    ? handleStopThread
+                    : undefined
+                }
               />
             )
           }

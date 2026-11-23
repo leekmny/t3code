@@ -8501,11 +8501,32 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               if (unloadInput.archive === true) {
                 yield* client.request("thread/archive", { threadId: nativeThreadId });
               } else {
-                // A resume may already wait on the pending entry; replacing it would strand that wait.
-                if (!threadClosings.has(nativeThreadId)) {
-                  threadClosings.set(nativeThreadId, yield* Deferred.make<void>());
+                const pending = threadClosings.get(nativeThreadId);
+                const closing = pending ?? (yield* Deferred.make<void>());
+                threadClosings.set(nativeThreadId, closing);
+                const { status } = yield* client.request("thread/unsubscribe", {
+                  threadId: nativeThreadId,
+                });
+                if (
+                  status === "notLoaded" ||
+                  (status === "notSubscribed" && pending === undefined)
+                ) {
+                  if (threadClosings.get(nativeThreadId) === closing) {
+                    threadClosings.delete(nativeThreadId);
+                  }
+                  yield* Deferred.succeed(closing, undefined);
+                } else if (unloadInput.awaitClosure === true) {
+                  // The unsubscribe reply precedes the writer release. Launch overrides can delay closure.
+                  if (
+                    Option.isNone(
+                      yield* Deferred.await(closing).pipe(Effect.timeoutOption("3 seconds")),
+                    )
+                  ) {
+                    yield* Effect.logWarning("Codex did not confirm native thread closure.", {
+                      providerThreadId: unloadInput.providerThread.id,
+                    });
+                  }
                 }
-                yield* client.request("thread/unsubscribe", { threadId: nativeThreadId });
               }
               // No turn/completed arrives for an unloaded thread, so a Stop Codex never
               // confirmed would otherwise keep its turn open for the life of the session.

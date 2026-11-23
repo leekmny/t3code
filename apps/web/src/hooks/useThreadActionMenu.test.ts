@@ -20,6 +20,7 @@ function deferred<T>() {
 const state = vi.hoisted(() => ({
   granted: new Set<string>(),
   effects: [] as string[],
+  supportsThreadStop: false,
   completed: deferred<void>(),
   show: vi.fn<
     (
@@ -49,6 +50,7 @@ vi.mock("../state/session", () => ({
 vi.mock("../state/entities", () => ({
   readEnvironmentServerConfigLoaded: () => true,
   readEnvironmentSupportsAutoSettleOptOut: () => true,
+  readEnvironmentSupportsThreadStop: () => state.supportsThreadStop,
   readThreadShell: () => ({
     id: "thread",
     environmentId: "secondary",
@@ -57,12 +59,27 @@ vi.mock("../state/entities", () => ({
     branch: "main",
     worktreePath: null,
     runtime: null,
-    latestRun: null,
+    archivedAt: null,
+    latestRun: { completedAt: "2026-11-23T00:00:00.000Z" },
   }),
   useProjects: () => [{ id: "project", environmentId: "secondary" }],
 }));
 vi.mock("../state/environments", () => ({ usePrimaryEnvironmentId: () => "primary" }));
-vi.mock("../state/threads", () => ({ threadEnvironment: { updateMetadata: "metadata" } }));
+vi.mock("../state/threads", () => ({ threadEnvironment: { interruptTurn: "interrupt" } }));
+vi.mock("../state/use-orchestration-command", () => ({
+  useOrchestrationCommand:
+    (operation: string) =>
+    async ({
+      environmentId,
+      input,
+    }: {
+      environmentId: string;
+      input: { threadId: string; runId?: string };
+    }) => {
+      recordEffect(`${operation}:${environmentId}:${input.threadId}:${input.runId ?? "thread"}`);
+      return AsyncResult.success(undefined);
+    },
+}));
 vi.mock("../state/use-atom-command", () => ({
   useAtomCommand: () => async () => {
     recordEffect("metadata");
@@ -161,6 +178,7 @@ const createMenu = (options: { readonly onFind?: (threadRef: typeof target) => v
 beforeEach(() => {
   state.granted = new Set(["primary"]);
   state.effects = [];
+  state.supportsThreadStop = false;
   state.completed = deferred<void>();
   state.show.mockReset().mockResolvedValue(null);
 });
@@ -192,5 +210,25 @@ describe("thread menu permissions", () => {
     expect(items[0]?.disabled).not.toBe(true);
     expect(state.effects).toEqual(["find"]);
     expect(onFind).toHaveBeenCalledExactlyOnceWith(target);
+  });
+
+  it("stops an idle thread without narrowing the request to its latest run", async () => {
+    state.granted.add("secondary");
+    state.supportsThreadStop = true;
+    state.show.mockResolvedValue("stop");
+    createMenu().openMenu(position);
+    expect(state.show.mock.calls[0]![0]).toContainEqual({
+      id: "stop",
+      label: "Stop background work",
+      icon: "square",
+    });
+    await state.completed.promise;
+    expect(state.effects).toEqual(["interrupt:secondary:thread:thread"]);
+  });
+
+  it("omits Stop background work when the server does not support thread-scoped Stop", () => {
+    state.granted.add("secondary");
+    createMenu().openMenu(position);
+    expect(state.show.mock.calls[0]![0].some((item) => item.id === "stop")).toBe(false);
   });
 });
